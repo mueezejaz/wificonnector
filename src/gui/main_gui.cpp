@@ -183,6 +183,10 @@ private:
     std::vector<InterfaceInfo> ifaces_;
     int selIface_{0};
     bool dropOpen_{false};
+    // Deepest verification level the GUI may use (1 = strict only).
+    int maxLevel_{1};
+    // Opt-in confirmation before the GUI may weaken certificate checking.
+    bool allowWeak_{false};
     std::wstring statusHead_{L"Not connected"};
     std::wstring statusDetail_{L"Select a network and press Connect."};
     CaInfo ca_;
@@ -1234,16 +1238,20 @@ void App::startConnect() {
 
     if (worker_.joinable()) worker_.join();
     const GUID gSel = currentIface();
-    worker_ = std::thread([this, o, gSel] {
+    const int maxLevel = maxLevel_;
+    worker_ = std::thread([this, o, gSel, maxLevel] {
         bool ok = false;
         try {
             Wlan w;
-            ConnectResult r = installAndConnect(
-                w, gSel, o, /*allUsers=*/false, /*timeoutMs=*/45000,
+            // Same ladder the CLI uses. The GUI never goes below Level 1
+            // without the user ticking "allow weaker verification".
+            ConnectResult r = connectWithLadder(
+                w, gSel, o, /*allUsers=*/false, /*timeoutMs=*/45000, maxLevel,
                 [this](Stage stage, const std::string& msg) {
                     pushLog(std::string(stage == Stage::Failed ? "Error: " : "") + msg);
                 });
             ok = r.ok;
+            for (const std::string& line : r.attempts) pushLog("  " + line);
         } catch (const std::exception& e) {
             pushLog(std::string("Error: ") + e.what());
         }

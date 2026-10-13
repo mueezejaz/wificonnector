@@ -20,44 +20,69 @@ connects.
 
 ## Current status
 
-**WPA2-PSK (personal networks) — works.** Profile installs and associates.
+**WPA2-PSK (personal networks) - works, verified end to end.** Profile install,
+association and authentication all succeed. See `TEST_REPORT.md`.
 
-**WPA2-Enterprise / 802.1X (eduroam) — not yet working.** The generated profile
-is accepted by the WLAN profile schema but is then rejected inside EAPHost
-(`ERROR_INVALID_FUNCTION` / `0x80420019`). See "Profile format gotchas" below
-for everything that has been established and ruled out.
+**WPA2-Enterprise / 802.1X (eduroam) - NOT verified.** The generated profile now
+clears the WLAN profile schema and EAPHost's XML parse, but Windows still returns
+`ERROR_INVALID_FUNCTION` (1) when installing it, before any credentials or
+certificates are involved. eduroam was also out of range during the final test
+round, so no live 802.1X handshake has been attempted. Do not assume it works.
 
-### Profile format gotchas (all verified empirically on Windows 11 26200)
+Run `edurm diagnose` to see the current state on your own machine.
 
-The WLAN profile schema is stricter than the documentation suggests. Each of
-these was found by bisecting against `WlanSetProfile` and `netsh wlan add
-profile`, which reports precise schema errors:
+### Bugs found and fixed (all verified on Windows 11 26200)
 
-| Gotcha | Wrong | Right |
+| Bug | Symptom | Fix |
 |---|---|---|
-| Root namespace | `https://www.microsoft.com/networking/WLAN/profile/v1` | **`http://`** — https yields "The WLAN profile element is missing" |
-| Enterprise auth token | `WPA2Enterprise`, `WPAEnterprise` | **`WPA2`** or `WPA` — the long forms are "invalid according to the schema" |
-| 802.1X location | top-level `<8021X>` sibling of `<MSM>` | **`<OneX>` immediately under `<MSM><security>`** |
-| Credentials | `<credentials><domain>` under `<MSM>` | **`<EapHostUserCredentials>` under `<EAPConfig>`** — `<credentials>` is not in the schema at all |
-| `<autoSwitch>` | emitting it | **omit it** — its presence alone makes PSK profiles fail with `ERROR_INVALID_PROFILE` |
-| PSK key material | empty `<keyMaterial>` | must contain the passphrase, else rejected |
-| `<EAPConfig>` namespace | `EapHostConfig` namespace | **inherit the `OneX/v1` default** — setting it explicitly is schema-invalid |
+| Root namespace `https://` | "The WLAN profile element is missing" | must be `http://` |
+| Enterprise token `WPA2Enterprise` | "invalid according to the schema" | must be `WPA2` / `WPA` |
+| Top-level `<8021X>` element | `ERROR_INVALID_PROFILE` | no such element; it is `<OneX>` under `<MSM><security>` |
+| `<credentials>` under `<MSM>` | `ERROR_INVALID_PROFILE` | not in the schema; credentials go through `WlanSetProfileEapXmlUserData` |
+| `<EapMethod>` child order | `0x80420019 EAP_E_EAPHOST_XML_MALFORMED` | XSD sequence is `Type, VendorId, VendorType, AuthorId` |
+| `<autoSwitch>` present | `ERROR_INVALID_PROFILE` (even for PSK) | omit it |
+| empty `<keyMaterial>` | profile rejected | must contain the passphrase |
+| PSK profile from the CLI | empty key | CLI fills `password`, generator read `psk` |
+| success message never printed | a successful connect looked like silence | `Stage::Succeeded` fell through to `default:` |
+| `busy_` stuck true after a scan | fields uneditable, buttons greyed out | scan never reported job completion |
 
-### Commands
+### Known remaining blocker
 
+`WlanSetProfile` returns 1206 with reason `ERROR_INVALID_FUNCTION` (1) for a
+schema-valid PEAP profile. The XML parses, EAPHost accepts the element order, and
+the adapter advertises WPA2-Enterprise + AES - but Windows refuses to install the
+profile. About 25 structural variants were tested against
+`netsh wlan add profile`: every namespace combination, EapMethod shapes,
+ServerValidation/PeapExtensions permutations, credential placement, per-user vs
+all-user, WPA/WPA2 and TKIP/AES.
+
+The step that would close this is empirical rather than analytical - export a
+profile the **Windows Settings UI** can build and connect with, then diff it
+against what this tool generates:
+
+```bat
+REM Settings -> Network & internet -> Wi-Fi -> connect to eduroam, then:
+netsh wlan export profile name="eduroam" folder=. key=clear
 ```
-edurm scan        # what is nearby; flags enterprise networks
-edurm caps        # auth/cipher pairs the adapter supports
-edurm connect     # create/update the profile and connect
-edurm status      # what am I connected to, and via which auth?
-edurm roots       # is the eduroam CA bundle installed?
-edurm install f.xml  # install a profile XML verbatim (import / testing)
-edurm export <name>  # print a profile's XML (password redacted)
-```
 
-`edurm install` is the escape hatch: it hands a file straight to
-`WlanSetProfile`, so you can test a profile exported from a working machine
-without touching this codebase.
+Anything Windows builds and `netsh wlan add profile` can re-import is by
+definition schema-valid, so diffing it will show the remaining difference.
+
+### The verification ladder
+
+`edurm connect` tries progressively weaker certificate checks and stops at the
+first success. It never steps down on its own - you decide how far it may go:
+
+| Level | Name | Checks | Allowed by |
+|---|---|---|---|
+| 1 | strict | system root store + server name must match | default |
+| 2 | pinned | as 1, with one specific CA pinned | `--ca-cert <file>` / `--pin-sha256 <hex>` |
+| 3 | legacy-tls | as 2, plus enabling TLS 1.0/1.1 machine-wide | `--allow-legacy-tls` (admin) |
+| 4 | no-validation | **nothing** - last resort, warns hard | `--insecure-skip-validation` |
+
+Levels 3 and 4 carry real security risk and are never defaults. See
+`USER_GUIDE.md`.
+
 
 ## The GUI
 

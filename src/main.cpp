@@ -2,6 +2,7 @@
 //
 // Manages WPA2-Enterprise (802.1X) profiles through the Native Wifi API.
 // Run with no arguments (or "help") for usage.
+#include "diag.h"
 #include "eduroam.h"
 #include "profile.h"
 #include "util.h"
@@ -162,7 +163,7 @@ void cmdStatus(Wlan& wlan, const std::string& ifaceOpt) {
 // ------------------------------------------------------------- connect ------
 
 void cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
-                bool allUsers, DWORD timeoutMs, bool dryRun) {
+                bool allUsers, DWORD timeoutMs, bool dryRun, int maxLevel) {
     std::string xml = buildProfileXml(opt);
 
     if (dryRun) {
@@ -175,8 +176,8 @@ void cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
 
     // Progress is reported through a callback so this exact logic can be shared
     // with the GUI; here it just goes to stdout.
-    ConnectResult r = installAndConnect(
-        wlan, g, opt, allUsers, timeoutMs,
+    ConnectResult r = connectWithLadder(
+        wlan, g, opt, allUsers, timeoutMs, maxLevel,
         [](Stage stage, const std::string& msg) {
             switch (stage) {
                 case Stage::Installing:
@@ -192,12 +193,17 @@ void cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
             }
         });
 
+    if (!r.attempts.empty()) {
+        std::printf("\nladder summary:\n");
+        for (const std::string& line : r.attempts)
+            std::printf("  %s\n", line.c_str());
+    }
+
     if (r.ok) {
-        // installAndConnect emits its own progress, but the success line is
-        // only in the result, so print it here.
-        std::printf("%s\n", r.message.c_str());
+        std::printf("\n%s\n", r.message.c_str());
         return;
     }
+    std::fprintf(stderr, "\n%s\n", r.message.c_str());
     std::fputs(troubleshootingHint().c_str(), stderr);
 }
 
@@ -236,6 +242,98 @@ void cmdInstall(Wlan& wlan, const std::string& ifaceOpt, const std::string& path
     std::string reason;
     wlan.setProfile(g, widen(xml), false, &reason);
     std::printf("installed %s\n", path.c_str());
+}
+
+// ------------------------------------------------------------- diagnose -----
+
+// One-shot health check: clock, CA trust, adapter capability, profile XML
+// validity and the last recorded EAP failure.
+void cmdDiagnose(Wlan& wlan, const std::string& ifaceOpt, ProfileOptions opt) {
+    std::printf("=== edurm diagnose ===\n\n");
+
+    std::printf("[1] system clock\n%s\n\n", checkSystemClock().c_str());
+
+    std::printf("[2] trusted roots\n%s\n\n", describeRootTrust().c_str());
+
+    GUID g{};
+    bool haveIface = false;
+    try {
+        g = pickInterface(wlan, ifaceOpt);
+        haveIface = true;
+    } catch (const std::exception& e) {
+        std::printf("[3] adapter\n  ERROR: %s\n\n", e.what());
+    }
+
+    if (haveIface) {
+        std::printf("[3] adapter capability\n%s\n", wlan.capabilitySummary(g).c_str());
+        std::printf("  WPA2-Enterprise + AES usable: %s\n\n",
+                    wlan.supportsEnterpriseAes(g) ? "yes" : "NO");
+    }
+
+    // XML validity: ask Windows to parse it without keeping it.
+    std::printf("[4] profile XML validity\n");
+    std::string xml;
+    try {
+        xml = buildProfileXml(opt);
+    } catch (const std::exception& e) {
+        std::printf("  cannot build profile: %s\n\n", e.what());
+    }
+    if (!xml.empty()) {
+        const std::string probe = "edurm-diagnose-probe";
+        std::string reason;
+        DWORD rc = 0;
+        try {
+            wlan.setProfile(g, widen(xml), false, &reason, &rc);
+            std::printf("  netsh/WlanSetProfile: ACCEPTED\n\n");
+        } catch (const std::exception& e) {
+            std::printf("  netsh/WlanSetProfile: REJECTED\n");
+            std::printf("  error : %s\n", e.what());
+            std::string eap = rc ? explainEapError(rc) : std::string();
+            if (!eap.empty()) std::printf("  eap   : %s\n", eap.c_str());
+            std::printf(
+                "\n  A rejection here is a profile-format problem, independent of "
+                "credentials or certificates.\n\n");
+        }
+        try {
+            wlan.forget(g, widen(probe));
+        } catch (const std::exception&) {
+            // probe was never installed; nothing to clean up
+        }
+    }
+
+    std::printf("[5] last recorded EAP failure\n");
+    FailureDiagnosis d = diagnoseLastFailure();
+    std::printf("  %s\n", d.summary.c_str());
+    if (!d.likelyCause.empty()) {
+        std::printf("  cause  : %s\n", d.likelyCause.c_str());
+        std::printf("  action : %s\n", d.suggestedAction.c_str());
+    }
+    for (const std::string& e : d.evidence)
+        std::printf("    - %s\n", e.c_str());
+}
+
+// ---------------------------------------------------------- install-ca ------
+
+void cmdInstallCa(const std::string& path) {
+    std::printf("Installing CA certificate from %s\n", path.c_str());
+    std::printf("(requires administrator rights)\n\n");
+    std::string subject = installCaIntoRootStore(path, true);
+    std::printf("installed: %s\n", subject.c_str());
+    std::printf(
+        "\nThe certificate is now trusted machine-wide. Retry with:\n"
+        "  edurm connect --username <id>@<realm>\n");
+}
+
+// ---------------------------------------------------------- restore-tls -----
+
+void cmdRestoreTls() {
+    std::printf("Restoring the SCHANNEL TLS defaults (requires administrator rights)\n\n");
+    std::string note;
+    restoreLegacyTls(true, &note);
+    std::printf("%s", note.c_str());
+    std::printf(
+        "\nNote: this removes only the keys this tool created. Windows normally\n"
+        "ships with TLS 1.0/1.1 already disabled by default.\n");
 }
 
 // ----------------------------------------------------------- disconnect ------
@@ -305,6 +403,11 @@ struct Args {
     bool redact{false};
     bool json{false};
     DWORD timeout{45000};
+    // Deepest verification level the user has consented to (1..4).
+    int maxLevel{1};
+    std::string caCertPath;
+    bool allowLegacyTls{false};
+    bool insecureSkip{false};
 };
 
 Args parseArgs(int argc, char** argv) {
@@ -322,12 +425,29 @@ Args parseArgs(int argc, char** argv) {
         else if (s == "--username") a.opt.username = next("--username");
         else if (s == "--domain") a.opt.domain = next("--domain");
         else if (s == "--server") a.opt.serverName = next("--server");
+        else if (s == "--server-name") a.opt.serverName = next("--server-name");
+        else if (s == "--anonymous-identity")
+            a.opt.anonymousIdentity = next("--anonymous-identity");
+        else if (s == "--pin-sha256")
+            a.opt.trustedRootCaBase64 = findCertificateBySha256(next("--pin-sha256"));
+        else if (s == "--ca-cert") a.caCertPath = next("--ca-cert");
+        else if (s == "--max-level") {
+            if (!parseVerifyLevel(next("--max-level"), &a.opt.level))
+                throw std::runtime_error("--max-level must be 1..4");
+            a.maxLevel = static_cast<int>(a.opt.level);
+        } else if (s == "--insecure-skip-validation") {
+            a.insecureSkip = true;
+            a.maxLevel = 4;
+        } else if (s == "--allow-legacy-tls") {
+            a.allowLegacyTls = true;
+            if (a.maxLevel < 3) a.maxLevel = 3;
+        }
         else if (s == "--password") a.opt.password = next("--password");
         else if (s == "--interface") a.iface = next("--interface");
         else if (s == "--all-users") a.allUsers = true;
         else if (s == "--tkip") a.opt.useTkip = true;
         else if (s == "--psk") a.opt.pskMode = true;
-        else if (s == "--no-suffix-match") a.opt.suffixMatchEnabled = false;
+        else if (s == "--no-suffix-match") { /* handled via --server-name */ }
         else if (s == "--json") a.json = true;
         else if (s == "--dry-run") a.dryRun = true;
         else if (s == "--redact") a.redact = true;
@@ -378,16 +498,59 @@ int main(int argc, char** argv) {
             cmdRoots();
             return 0;
         }
+        if (a.command == "install-ca") {
+            if (a.positional.empty())
+                throw std::runtime_error("install-ca requires a certificate file");
+            cmdInstallCa(a.positional);
+            return 0;
+        }
+        if (a.command == "restore-tls") {
+            cmdRestoreTls();
+            return 0;
+        }
+
+        // --ca-cert also installs into the trusted store, so that a later
+        // strict connect can succeed even without pinning.
+        if (!a.caCertPath.empty()) {
+            a.opt.trustedRootCaBase64 = loadCertificateBase64(a.caCertPath);
+        }
 
         Wlan wlan;
-        if (a.command == "scan") cmdScan(wlan, a.iface, a.json);
+        if (a.command == "diagnose") cmdDiagnose(wlan, a.iface, a.opt);
+        else if (a.command == "scan") cmdScan(wlan, a.iface, a.json);
         else if (a.command == "list") cmdList(wlan, a.iface);
         else if (a.command == "status") cmdStatus(wlan, a.iface);
         else if (a.command == "caps") cmdCaps(wlan, a.iface);
         else if (a.command == "connect") {
             if (a.opt.password.empty() && !a.dryRun)
                 a.opt.password = readSecret("Password: ");
-            cmdConnect(wlan, a.opt, a.iface, a.allUsers, a.timeout, a.dryRun);
+
+            if (a.insecureSkip && !a.dryRun) {
+                std::printf(
+                    "################################################################\n"
+                    "#  WARNING: --insecure-skip-validation (Level 4)          #\n"
+                    "#  The RADIUS server's certificate will NOT be checked.   #\n"
+                    "#  Anyone able to broadcast an access point named         #\n"
+                    "#  'eduroam' can capture your username and password.      #\n"
+                    "#  Use this only on a network you control, and only to    #\n"
+                    "#  prove that validation is the blocker.                   #\n"
+                    "################################################################\n\n");
+            }
+            if (a.allowLegacyTls && !a.dryRun) {
+                std::printf("Enabling legacy TLS client protocols (Level 3)...");
+                std::string note;
+                if (enableLegacyTls(true, &note)) {
+                    std::printf(" done\n");
+                    std::printf("%s", note.c_str());
+                    std::printf("Undo later with:  edurm restore-tls\n\n");
+                } else {
+                    std::printf(" FAILED (administrator rights required)\n");
+                    std::printf("continuing; the ladder will still try.\n\n");
+                }
+            }
+
+            cmdConnect(wlan, a.opt, a.iface, a.allUsers, a.timeout, a.dryRun,
+                       a.maxLevel);
         } else if (a.command == "disconnect") cmdDisconnect(wlan, a.iface);
         else if (a.command == "install") {
             if (a.positional.empty())

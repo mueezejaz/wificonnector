@@ -176,7 +176,7 @@ WLAN_CONNECTION_ATTRIBUTES Wlan::connection(const GUID& iface) {
 }
 
 void Wlan::setProfile(const GUID& iface, const std::wstring& xml, bool allUsers,
-                      std::string* reasonOut) {
+                      std::string* reasonOut, DWORD* reasonCodeOut) {
     // dwFlags of 0 means "all users"; WLAN_PROFILE_USER scopes it to the
     // current user, which is what you want for student credentials.
     DWORD flags = allUsers ? 0u : static_cast<DWORD>(WLAN_PROFILE_USER);
@@ -188,6 +188,7 @@ void Wlan::setProfile(const GUID& iface, const std::wstring& xml, bool allUsers,
                               // profiles, which authenticate per user.
                               nullptr, TRUE /* bOverwrite */, nullptr, &reasonCode);
     if (reasonOut) *reasonOut = reasonCode ? reasonCodeText(reasonCode) : std::string();
+    if (reasonCodeOut) *reasonCodeOut = reasonCode;
 
     if (rc != ERROR_SUCCESS) {
         std::string msg = "WlanSetProfile: " + winError(rc);
@@ -195,6 +196,52 @@ void Wlan::setProfile(const GUID& iface, const std::wstring& xml, bool allUsers,
             msg += "; reason: " + reasonCodeText(reasonCode);
         throw std::runtime_error(msg);
     }
+}
+
+void Wlan::setEapXmlUserData(const GUID& iface, const std::wstring& profileName,
+                             const std::wstring& xml, bool allUsers) {
+    // Flag must match how the profile was installed, otherwise Windows looks
+    // for the credential blob in the wrong store.
+    DWORD flags = allUsers ? 0u : static_cast<DWORD>(WLAN_PROFILE_USER);
+    DWORD rc = WlanSetProfileEapXmlUserData(h_, &iface, profileName.c_str(), flags,
+                                            xml.c_str(), nullptr);
+    if (rc != ERROR_SUCCESS)
+        throw std::runtime_error("WlanSetProfileEapXmlUserData: " + winError(rc));
+}
+
+bool Wlan::supportsEnterpriseAes(const GUID& iface) {
+    try {
+        for (const std::string& p : supportedAuthCipherPairs(iface)) {
+            if (p.find("Enterprise") != std::string::npos &&
+                p.find("CCMP (AES)") != std::string::npos)
+                return true;
+        }
+    } catch (const std::exception&) {
+        return false;
+    }
+    return false;
+}
+
+std::string Wlan::capabilitySummary(const GUID& iface) {
+    std::string out;
+    try {
+        auto pairs = supportedAuthCipherPairs(iface);
+        bool anyEnt = false, anyAesEnt = false;
+        for (const std::string& p : pairs) {
+            if (p.find("Enterprise") != std::string::npos) {
+                anyEnt = true;
+                if (p.find("CCMP (AES)") != std::string::npos) anyAesEnt = true;
+            }
+        }
+        out += "auth/cipher pairs advertised: " + std::to_string(pairs.size()) + "\n";
+        out += anyEnt ? "  802.1X (Enterprise): yes\n"
+                      : "  802.1X (Enterprise): NO\n";
+        out += anyAesEnt ? "  WPA2-Enterprise + AES: yes\n"
+                         : "  WPA2-Enterprise + AES: NO\n";
+    } catch (const std::exception& e) {
+        out += std::string("  could not query capabilities: ") + e.what() + "\n";
+    }
+    return out;
 }
 
 void Wlan::connect(const GUID& iface, const std::wstring& profileName) {

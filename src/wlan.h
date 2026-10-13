@@ -55,7 +55,20 @@ public:
     // Installs or replaces a profile. Throws on failure and includes the
     // extended reason code (WLAN_REASON_CODE_*) from the OS.
     void setProfile(const GUID& iface, const std::wstring& xml,
-                    bool allUsers, std::string* reasonOut);
+                    bool allUsers, std::string* reasonOut,
+                    DWORD* reasonCodeOut = nullptr);
+
+    // Attaches PEAP user credentials to an already-installed profile. This is
+    // how Windows stores per-user EAP data; credentials must NOT be embedded in
+    // the profile XML itself. `xml` is an EapHostUserCredentials document.
+    void setEapXmlUserData(const GUID& iface, const std::wstring& profileName,
+                           const std::wstring& xml, bool allUsers);
+
+    // True if the adapter advertises WPA2/WPA Enterprise (802.1X) with CCMP/AES.
+    bool supportsEnterpriseAes(const GUID& iface);
+
+    // Human-readable interface capability summary, for diagnostics.
+    std::string capabilitySummary(const GUID& iface);
     void connect(const GUID& iface, const std::wstring& profileName);
     void disconnect(const GUID& iface);
     void forget(const GUID& iface, const std::wstring& profileName);

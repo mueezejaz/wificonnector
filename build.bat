@@ -48,10 +48,10 @@ REM /DUNICODE /D_UNICODE : UTF-16 Win32 entry points
 REM NOMINMAX is required: windows.h otherwise defines min()/max() as macros,
 REM which breaks std::min/std::max in the GUI.
 cl /nologo /EHsc /std:c++17 /W4 /utf-8 /O2 /MT ^
-   /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   /DNOMINMAX /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    /Fe:build\edurm.exe /Fo:build\ ^
-   src\main.cpp src\util.cpp src\wlan.cpp src\profile.cpp src\eduroam.cpp ^
-   /link wlanapi.lib ole32.lib crypt32.lib advapi32.lib
+   src\main.cpp src\util.cpp src\wlan.cpp src\profile.cpp src\eduroam.cpp src\diag.cpp ^
+   /link wlanapi.lib ole32.lib crypt32.lib advapi32.lib wevtapi.lib bcrypt.lib
 
 if errorlevel 1 (
   echo.
@@ -71,12 +71,12 @@ REM CLI objects in build\.
 if not exist build\gui mkdir build\gui
 
 cl /nologo /EHsc /std:c++17 /W4 /utf-8 /O2 /MT ^
-   /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+   /DNOMINMAX /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    /Fe:build\edurm-gui.exe /Fo:build\gui\ ^
-   src\gui\main_gui.cpp src\util.cpp src\wlan.cpp src\profile.cpp src\eduroam.cpp ^
+   src\gui\main_gui.cpp src\util.cpp src\wlan.cpp src\profile.cpp src\eduroam.cpp src\diag.cpp ^
    /link /SUBSYSTEM:WINDOWS ^
          wlanapi.lib ole32.lib crypt32.lib advapi32.lib ^
-         user32.lib gdi32.lib comctl32.lib dwmapi.lib uxtheme.lib
+         user32.lib gdi32.lib comctl32.lib dwmapi.lib uxtheme.lib advapi32.lib wevtapi.lib bcrypt.lib
 
 if errorlevel 1 (
   echo.

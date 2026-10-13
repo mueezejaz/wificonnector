@@ -12,6 +12,9 @@ namespace edurm {
 // types or reads on the console is UTF-8.
 std::wstring widen(const std::string& utf8);
 std::string  narrow(const std::wstring& utf16);
+inline std::string narrow(const wchar_t* s) {
+    return s ? narrow(std::wstring(s)) : std::string();
+}
 
 // Human-readable text for a Win32 error code (Wlan* functions return these).
 std::string winError(DWORD code);
