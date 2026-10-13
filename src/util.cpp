@@ -23,8 +23,13 @@ std::wstring widen(const std::string& utf8) {
     if (utf8.empty()) return {};
     int need = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
     if (need <= 0) return {};
-    std::wstring out(static_cast<size_t>(need - 1), L'\0');  // drop the NUL
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, out.data(), need);
+    // -1 includes the terminating NUL in `need`, so allocate `need` and drop the
+    // NUL after conversion. Sizing the string to need-1 while asking the API to
+    // write `need` chars wrote one wchar_t past the end of the buffer.
+    std::wstring out(static_cast<size_t>(need), L'\0');
+    int written = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, out.data(), need);
+    if (written <= 0) return {};
+    out.resize(static_cast<size_t>(written) - 1);  // drop the NUL
     return out;
 }
 
@@ -75,6 +80,12 @@ std::string toHex(const std::string& bytes) {
         out.push_back(kDigits[c & 0x0F]);
     }
     return out;
+}
+
+std::string ssidToBytes(const DOT11_SSID& ssid) {
+    if (ssid.uSSIDLength == 0) return {};
+    const char* raw = reinterpret_cast<const char*>(ssid.ucSSID);
+    return std::string(raw, std::min<size_t>(ssid.uSSIDLength, sizeof(ssid.ucSSID)));
 }
 
 std::string ssidToString(const DOT11_SSID& ssid) {
@@ -163,12 +174,28 @@ std::string bssTypeName(DOT11_BSS_TYPE t) {
 }
 
 std::string readSecret(const char* prompt) {
+    // _getwch() reads CONIN$ and BLOCKS when there is no console to read from.
+    // With stdin redirected (a script, a scheduled task, a service) it never
+    // returns at all, so `edurm connect` used to hang forever. Check that stdin
+    // really is a console first, and refuse to prompt when it is not.
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (hIn == INVALID_HANDLE_VALUE || !GetConsoleMode(hIn, &mode)) {
+        fputs("error: cannot prompt for a password - stdin is not a console.\n"
+              "       use --password-stdin (echo secret | edurm connect "
+              "--password-stdin)\n"
+              "       or --password.\n",
+              stderr);
+        return {};
+    }
+
     fputs(prompt, stdout);
     fflush(stdout);
 
     std::string out;
     for (;;) {
         wint_t c = _getwch();
+        if (c == WEOF) break;  // console closed mid-read
         if (c == L'\r' || c == L'\n') break;
         if (c == L'\003') {  // Ctrl+C
             fputc('\n', stdout);

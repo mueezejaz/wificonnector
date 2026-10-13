@@ -116,14 +116,25 @@ The most common real-world failure is a missing CA bundle, not a wrong profile.
 
 ```bat
 REM 1. download the bundle from https://www.eduroam.org/ (or ask your IT desk)
-REM 2. import it (needs an elevated prompt)
+REM 2. import it for your account
 edurm install-ca eduroam_roots.crt
 REM 3. retry
 edurm connect --username <id>@<realm>
 ```
 
-`install-ca` puts the certificate in the machine's trusted ROOT store, which is
-what "CA certificate: use system certificates" on your eduroam card means.
+`install-ca` adds the certificate to **your account's** trusted ROOT store
+(`HKCU`). That is enough for `edurm` to validate the server, and it needs no
+administrator rights. To trust it for the whole machine instead, run from an
+elevated prompt:
+
+```bat
+edurm install-ca eduroam_roots.crt --machine
+```
+
+`.crt`/`.pem` and binary `.cer`/`.der` files are all accepted.
+
+`install-ca` adds to the trusted ROOT store, which is what "CA certificate: use
+system certificates" on your eduroam card means.
 
 **Note:** `edurm roots` reports "none found" when it cannot find a root whose
 *subject name* mentions eduroam/terena/eduPKI/GÉANT. That is a keyword search,

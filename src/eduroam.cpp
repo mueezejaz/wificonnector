@@ -123,43 +123,56 @@ ConnectResult connectWithLadder(Wlan& wlan, const GUID& iface,
     // TLS setting - so it is reported rather than silently changed.
     const bool legacyWarned = (maxLevel >= 3);
 
+    // The per-rung history is accumulated here and attached to the result at the
+    // end. It used to be kept in `final.attempts` while `final = r` overwrote the
+    // whole struct on each failure, so every failure threw the history away.
+    std::vector<std::string> attempts;
+
     for (int lvl = 1; lvl <= maxLevel; ++lvl) {
         ProfileOptions opt = base;
         opt.level = static_cast<VerifyLevel>(lvl);
 
-        if (lvl >= 2 && opt.trustedRootCaBase64.empty()) {
-            final.attempts.push_back(
-                "level 2 (pinned) skipped: no CA supplied. Use --ca-cert or "
-                "--pin-sha256.");
+        // Levels 2 and 3 both pin a CA, so they cannot run without one. Level 4 does
+        // NOT pin anything - it turns validation off - so it must never be skipped
+        // for a missing CA, or --insecure-skip-validation silently does nothing.
+        if (lvl >= 2 && lvl <= 3 && opt.trustedRootCaBase64.empty()) {
+            attempts.push_back(
+                "level " + std::to_string(lvl) + " (" + verifyLevelName(opt.level) +
+                ") skipped: no CA supplied. Use --ca-cert or --pin-sha256.");
             continue;
         }
 
         if (lvl == 3 && !legacyWarned) {
-            final.attempts.push_back("level 3 (legacy-tls) skipped: not requested");
+            attempts.push_back("level 3 (legacy-tls) skipped: not requested");
             continue;
         }
         if (lvl == 4) {
-            final.attempts.push_back(
+            attempts.push_back(
                 "level 4 (no-validation) ATTEMPTED - the server certificate is not "
                 "being checked. Anyone on this network could capture your password.");
         }
 
         ConnectResult r = installAndConnect(wlan, iface, opt, allUsers, timeoutMs,
                                             onProgress);
-        final.attempts.push_back("level " + std::to_string(lvl) + " (" +
-                                  verifyLevelName(opt.level) + "): " +
-                                  (r.ok ? "connected" : r.message));
+        attempts.push_back("level " + std::to_string(lvl) + " (" +
+                           verifyLevelName(opt.level) + "): " +
+                           (r.ok ? "connected" : r.message));
 
         if (r.ok) {
-            r.attempts = final.attempts;
+            r.attempts = attempts;
             return r;
         }
-        final = r;
+        // Carry the most recent failure forward, but keep the accumulated log.
+        final.message = r.message;
         final.levelUsed = 0;
         final.levelName.clear();
     }
 
-    final.message = "all permitted verification levels failed";
+    final.attempts = attempts;
+    if (final.message.empty())
+        final.message = "no verification level was attempted";
+    else
+        final.message = "all permitted verification levels failed: " + final.message;
     if (onProgress) onProgress(Stage::Failed, final.message);
     return final;
 }
@@ -197,34 +210,12 @@ std::string certDisplayName(PCCERT_CONTEXT ctx) {
 }
 
 std::string fileToBase64(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open: " + path);
-    std::string raw((std::istreambuf_iterator<char>(f)),
-                    std::istreambuf_iterator<char>());
-    std::string body;
-    if (raw.find("-----BEGIN") != std::string::npos) {
-        size_t b = raw.find('\n', raw.find("-----BEGIN"));
-        size_t e = raw.find("-----END");
-        if (b == std::string::npos || e == std::string::npos || e < b)
-            throw std::runtime_error("malformed PEM: " + path);
-        body = raw.substr(b + 1, e - b - 1);
-        std::string cleaned;
-        for (char c : body)
-            if (c != '-' && !isspace(static_cast<unsigned char>(c))) cleaned.push_back(c);
-        body = cleaned;
-    } else {
-        body = raw;
-    }
-    std::string trimmed;
-    for (char c : body)
-        if (!isspace(static_cast<unsigned char>(c))) trimmed.push_back(c);
-    return trimmed;
+    return readCertificateBase64(path);
 }
 
 }  // namespace
 
 std::string installCaIntoRootStore(const std::string& path, bool machineWide) {
-    (void)machineWide;  // always the machine store; per-user adds no safety here
     std::string b64 = fileToBase64(path);
     DWORD len = static_cast<DWORD>(b64.size() / 4 * 3 + 3);
     std::vector<unsigned char> der(len);
@@ -234,7 +225,14 @@ std::string installCaIntoRootStore(const std::string& path, bool machineWide) {
         len == 0)
         throw std::runtime_error("could not decode certificate: " + path);
 
-    HCERTSTORE store = CertOpenSystemStoreW(0, L"ROOT");
+    // The hKey parameter selects the hive: HKEY_LOCAL_MACHINE needs elevation,
+    // 0 means the current user. This used to hardcode 0 while reporting
+    // "machine-wide", quietly installing a per-user root instead.
+    // The first parameter is an HKEY. Windows Kits 10.0.26100 declares it as
+    // HCRYPTPROV_LEGACY, which is a documentation typo in the header, so cast.
+    HKEY hive = machineWide ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+    HCERTSTORE store =
+        CertOpenSystemStoreW(reinterpret_cast<HCRYPTPROV_LEGACY>(hive), L"ROOT");
     if (!store) throw std::runtime_error("CertOpenSystemStore failed");
 
     PCCERT_CONTEXT ctx = CertCreateCertificateContext(X509_ASN_ENCODING, der.data(),

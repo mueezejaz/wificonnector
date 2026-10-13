@@ -61,8 +61,10 @@ struct CaInfo {
 
 CaInfo checkEduroamRoots();
 
-// Imports a PEM/DER certificate file into the machine's trusted ROOT store.
-// Requires administrator rights. Returns the certificate subject on success.
+// Imports a PEM/DER certificate file into the trusted ROOT store. When
+// `machineWide` is true the machine store (HKLM) is used, which requires
+// administrator rights; otherwise it goes into the current user's store (HKCU).
+// Returns the certificate subject on success.
 std::string installCaIntoRootStore(const std::string& path, bool machineWide);
 
 // TLS client legacy-enable (fallback Level 3). Records the previous registry

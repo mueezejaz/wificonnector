@@ -5,7 +5,6 @@
 
 #include <windows.h>
 #include <evntcons.h>  // EVT_QUERY, EVT_LOG_CHANNEL_NAME
-#include <winevt.h>    // the SDK ships the event-log API here, not wevtapi.h
 
 #include <sstream>
 
@@ -19,21 +18,24 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-// The Windows SDK shipped here declares only EvtClose; the modern event-log API
-// (EvtQuery/EvtNext/EvtFormatMessage) lives in wevtapi.dll at runtime but has no
-// header or import lib available. Rather than take a hard dependency on an
-// import library this project does not otherwise need, the few entry points are
-// declared here and resolved at run time from the system DLL.
+// The SDK on some machines ships wevtapi.lib but not winevtapi.h (the header is
+// genuinely absent from Windows Kits 10.0.26100.0\um). The prototypes below are
+// transcribed from the documented API, so they must match the real ones exactly
+// - the previous hand-written variants had 6-7 parameter lists where the API
+// takes 4 and 9, which silently turned every event-log call into garbage.
+//
+//   EVT_HANDLE EvtOpenLog(LPCWSTR ChannelPath, DWORD Flags);
+//   EVT_HANDLE EvtQuery(EVT_HANDLE Session, LPCWSTR Path, LPCWSTR Query, DWORD Flags);
+//   BOOL       EvtNext(EVT_HANDLE QueryResults, ULONG EventSize, PEVT_HANDLE* EventBuffer);
+//   BOOL       EvtFormatMessage(EVT_HANDLE PublisherMetadata, EVT_HANDLE Event,
+//                               DWORD MessageId, DWORD ValueCount, PEVT_VARIANT Values,
+//                               DWORD Flags, DWORD BufferSize, LPWSTR Buffer,
+//                               PDWORD BufferUsed);
+//   BOOL       EvtClose(EVT_HANDLE);
 namespace evtlog {
 
 using EvtHandle = void*;
-
-struct Query {
-    wchar_t* EventChannelPath;
-    wchar_t* Query;
-    BOOL ReverseDirection;
-    DWORD TolerateQueryErrors;
-};
+using EvtHandlePtr = EvtHandle*;
 
 // Flags from evntcons.h.
 constexpr DWORD kEvtOpenChannelPath = 0x1;
@@ -44,10 +46,10 @@ constexpr DWORD kEvtFormatMessageEvent = 0x1;
 constexpr DWORD kEvtFormatMessageAllocateBuffer = 0x4;
 
 using PfnOpenLog = EvtHandle(WINAPI*)(LPCWSTR, DWORD);
-using PfnQuery = EvtHandle(WINAPI*)(EvtHandle, const Query*, DWORD);
-using PfnNext = BOOL(WINAPI*)(EvtHandle, ULONG, EvtHandle*);
-using PfnFormatMessage = DWORD(WINAPI*)(EvtHandle, DWORD, LPCWSTR, DWORD, LPWSTR,
-                                        DWORD, LPWSTR*);
+using PfnQuery = EvtHandle(WINAPI*)(EvtHandle, LPCWSTR, LPCWSTR, DWORD);
+using PfnNext = BOOL(WINAPI*)(EvtHandle, ULONG, EvtHandlePtr);
+using PfnFormatMessage = BOOL(WINAPI*)(EvtHandle, EvtHandle, DWORD, DWORD, PVOID, DWORD,
+                                       DWORD, LPWSTR, DWORD*);
 using PfnClose = BOOL(WINAPI*)(EvtHandle);
 
 struct Api {
@@ -93,17 +95,38 @@ std::vector<std::string> recentEvents(const wchar_t* channel, int maxCount,
     evtlog::EvtHandle log = api.openLog(channel, evtlog::kEvtOpenChannelPath);
     if (!log) return out;
 
-    std::wstring q = ids && *ids ? (L"*[(System[(EventID)=" + std::wstring(ids) + L")])")
-                                 : L"*[System[(Level=2 or Level=3)]]";
+    // Each id must repeat the comparison: "A or B" inside a predicate makes B a
+    // boolean literal, so the whole filter collapses to always-true and the
+    // query returns the entire channel instead of the events we asked for.
+    std::wstring q;
+    if (ids && *ids) {
+        q = L"*[System[";
+        const std::wstring idList = ids;
+        size_t pos = 0;
+        bool first = true;
+        while (pos <= idList.size()) {
+            size_t orPos = idList.find(L" or ", pos);
+            std::wstring one = idList.substr(
+                pos, orPos == std::wstring::npos ? std::wstring::npos : orPos - pos);
+            // Trim the id itself, so "12012 or 11004" and a stray space both work.
+            while (!one.empty() && iswspace(one.front())) one.erase(one.begin());
+            while (!one.empty() && iswspace(one.back())) one.pop_back();
+            if (!one.empty()) {
+                if (!first) q += L" or ";
+                q += L"(EventID)=" + one;
+                first = false;
+            }
+            if (orPos == std::wstring::npos) break;
+            pos = orPos + 4;
+        }
+        q += L"]]";
+    } else {
+        q = L"*[System[(Level=2 or Level=3)]]";
+    }
 
-    evtlog::Query query{};
-    query.EventChannelPath = const_cast<LPWSTR>(channel);
-    query.Query = const_cast<LPWSTR>(q.c_str());
-    query.ReverseDirection = TRUE;  // newest first
-    query.TolerateQueryErrors = TRUE;
-
-    evtlog::EvtHandle res =
-        api.query(log, &query, evtlog::kEvtQueryChannelPath);
+    DWORD flags = evtlog::kEvtQueryChannelPath | evtlog::kEvtQueryReverseDirection |
+                  evtlog::kEvtQueryTolerateQueryErrors;
+    evtlog::EvtHandle res = api.query(/*Session=*/nullptr, channel, q.c_str(), flags);
     if (!res) {
         api.close(log);
         return out;
@@ -111,16 +134,17 @@ std::vector<std::string> recentEvents(const wchar_t* channel, int maxCount,
 
     evtlog::EvtHandle ev = nullptr;
     while (out.size() < static_cast<size_t>(maxCount) && api.next(res, 1, &ev)) {
+        // PublisherMetadata=NULL is valid for events rendered by the service.
+        // Always use the allocate variant: it is the only one that gives us a
+        // buffer, and a NULL/0 probe call returns an error, not a size.
         wchar_t* buf = nullptr;
-        DWORD needed = api.formatMessage(ev, evtlog::kEvtFormatMessageEvent, nullptr,
-                                         0, nullptr, 0, nullptr);
-        if (needed == 0) {
-            api.formatMessage(ev,
+        if (api.formatMessage(/*PublisherMetadata=*/nullptr, ev, /*MessageId=*/0,
+                              /*ValueCount=*/0, /*Values=*/nullptr,
                               evtlog::kEvtFormatMessageEvent |
                                   evtlog::kEvtFormatMessageAllocateBuffer,
-                              nullptr, 0, nullptr, 0, &buf);
-        }
-        if (buf) {
+                              /*BufferSize=*/0, nullptr,
+                              /*BufferUsed=*/nullptr) &&
+            buf) {
             std::string line = trim(narrow(buf));
             size_t nl = line.find('\n');
             if (nl != std::string::npos) line = line.substr(0, nl);

@@ -27,6 +27,33 @@ using namespace edurm;
 
 namespace {
 
+// JSON string escaping for --json output. SSIDs come from the radio and may
+// contain quotes, backslashes or control characters.
+std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char esc[7];
+                    std::snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    out += esc;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    return out;
+}
+
 void printUsage() {
     std::puts(
         "edurm - eduroam profile helper (Windows Native Wifi API)\n"
@@ -59,6 +86,7 @@ void printUsage() {
         "  --no-suffix-match    Do not require the cert domain suffix\n"
         "  --timeout <ms>       Connection timeout       (default: 45000)\n"
         "  --dry-run            Print what would be installed, change nothing\n"
+        "  --machine            install-ca: trust the CA machine-wide (needs admin)\n"
         "  --redact             Hide the password in 'xml' output\n"
         "  --json               Machine-readable output where supported\n"
         "\n"
@@ -79,11 +107,14 @@ void cmdScan(Wlan& wlan, const std::string& ifaceOpt, bool json) {
         std::printf("{\"networks\":[");
         for (size_t i = 0; i < nets.size(); ++i) {
             const auto& n = nets[i];
+            // Escape the SSID/auth/cipher strings: an SSID may legally contain
+            // '"' or '\', which would otherwise produce invalid JSON.
             std::printf("%s{\"ssid\":\"%s\",\"signal\":%lu,\"enterprise\":%s,"
                         "\"auth\":\"%s\",\"cipher\":\"%s\"}",
-                        i ? "," : "", n.ssid.c_str(), n.signalQuality,
+                        i ? "," : "", jsonEscape(n.ssid).c_str(), n.signalQuality,
                         n.enterprise() ? "true" : "false",
-                        authName(n.auth).c_str(), cipherName(n.cipher).c_str());
+                        jsonEscape(authName(n.auth)).c_str(),
+                        jsonEscape(cipherName(n.cipher)).c_str());
         }
         std::printf("]}\n");
         return;
@@ -162,13 +193,15 @@ void cmdStatus(Wlan& wlan, const std::string& ifaceOpt) {
 
 // ------------------------------------------------------------- connect ------
 
-void cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
-                bool allUsers, DWORD timeoutMs, bool dryRun, int maxLevel) {
+// Returns the process exit code: 0 on success, 1 on failure. The CLI is
+// documented as being for scripting, so a failed connect must not report 0.
+int cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
+               bool allUsers, DWORD timeoutMs, bool dryRun, int maxLevel) {
     std::string xml = buildProfileXml(opt);
 
     if (dryRun) {
         std::puts(redactPassword(xml).c_str());
-        return;
+        return 0;
     }
 
     GUID g = pickInterface(wlan, ifaceOpt);
@@ -201,10 +234,11 @@ void cmdConnect(Wlan& wlan, ProfileOptions opt, const std::string& ifaceOpt,
 
     if (r.ok) {
         std::printf("\n%s\n", r.message.c_str());
-        return;
+        return 0;
     }
     std::fprintf(stderr, "\n%s\n", r.message.c_str());
     std::fputs(troubleshootingHint().c_str(), stderr);
+    return 1;
 }
 
 // ---------------------------------------------------------------- caps ------
@@ -272,18 +306,23 @@ void cmdDiagnose(Wlan& wlan, const std::string& ifaceOpt, ProfileOptions opt) {
 
     // XML validity: ask Windows to parse it without keeping it.
     std::printf("[4] profile XML validity\n");
-    std::string xml;
+    // The probe must carry its OWN profile name. Installing XML whose <name> is
+    // the user's real profile (default "eduroam") silently overwrote it, and
+    // then the forget() below targeted a name that never existed, so the damage
+    // was never cleaned up.
+    ProfileOptions probeOpt = opt;
+    probeOpt.profileName = "edurm-diagnose-probe";
+    std::string probeXml;
     try {
-        xml = buildProfileXml(opt);
+        probeXml = buildProfileXml(probeOpt);
     } catch (const std::exception& e) {
         std::printf("  cannot build profile: %s\n\n", e.what());
     }
-    if (!xml.empty()) {
-        const std::string probe = "edurm-diagnose-probe";
+    if (!probeXml.empty()) {
         std::string reason;
         DWORD rc = 0;
         try {
-            wlan.setProfile(g, widen(xml), false, &reason, &rc);
+            wlan.setProfile(g, widen(probeXml), false, &reason, &rc);
             std::printf("  netsh/WlanSetProfile: ACCEPTED\n\n");
         } catch (const std::exception& e) {
             std::printf("  netsh/WlanSetProfile: REJECTED\n");
@@ -294,8 +333,10 @@ void cmdDiagnose(Wlan& wlan, const std::string& ifaceOpt, ProfileOptions opt) {
                 "\n  A rejection here is a profile-format problem, independent of "
                 "credentials or certificates.\n\n");
         }
+        // Always attempt the cleanup, so a profile this command created does not
+        // linger even when the install succeeded.
         try {
-            wlan.forget(g, widen(probe));
+            wlan.forget(g, widen(probeOpt.profileName));
         } catch (const std::exception&) {
             // probe was never installed; nothing to clean up
         }
@@ -314,14 +355,21 @@ void cmdDiagnose(Wlan& wlan, const std::string& ifaceOpt, ProfileOptions opt) {
 
 // ---------------------------------------------------------- install-ca ------
 
-void cmdInstallCa(const std::string& path) {
+void cmdInstallCa(const std::string& path, bool machineWide) {
     std::printf("Installing CA certificate from %s\n", path.c_str());
-    std::printf("(requires administrator rights)\n\n");
-    std::string subject = installCaIntoRootStore(path, true);
+    std::printf(machineWide ? "(into the machine store; needs administrator rights)\n\n"
+                            : "(into the current user's store)\n\n");
+    std::string subject = installCaIntoRootStore(path, machineWide);
     std::printf("installed: %s\n", subject.c_str());
-    std::printf(
-        "\nThe certificate is now trusted machine-wide. Retry with:\n"
-        "  edurm connect --username <id>@<realm>\n");
+    if (machineWide)
+        std::printf(
+            "\nThe certificate is now trusted machine-wide. Retry with:\n"
+            "  edurm connect --username <id>@<realm>\n");
+    else
+        std::printf(
+            "\nThe certificate is now trusted for YOUR account only. Other users and\n"
+            "services on this machine will not trust it. To trust it machine-wide, run\n"
+            "this from an elevated prompt:  edurm install-ca <file> --machine\n");
 }
 
 // ---------------------------------------------------------- restore-tls -----
@@ -408,6 +456,7 @@ struct Args {
     std::string caCertPath;
     bool allowLegacyTls{false};
     bool insecureSkip{false};
+    bool machineWide{false};
 };
 
 Args parseArgs(int argc, char** argv) {
@@ -445,6 +494,7 @@ Args parseArgs(int argc, char** argv) {
         else if (s == "--password") a.opt.password = next("--password");
         else if (s == "--interface") a.iface = next("--interface");
         else if (s == "--all-users") a.allUsers = true;
+        else if (s == "--machine") a.machineWide = true;
         else if (s == "--tkip") a.opt.useTkip = true;
         else if (s == "--psk") a.opt.pskMode = true;
         else if (s == "--no-suffix-match") { /* handled via --server-name */ }
@@ -501,7 +551,7 @@ int main(int argc, char** argv) {
         if (a.command == "install-ca") {
             if (a.positional.empty())
                 throw std::runtime_error("install-ca requires a certificate file");
-            cmdInstallCa(a.positional);
+            cmdInstallCa(a.positional, a.machineWide);
             return 0;
         }
         if (a.command == "restore-tls") {
@@ -522,8 +572,20 @@ int main(int argc, char** argv) {
         else if (a.command == "status") cmdStatus(wlan, a.iface);
         else if (a.command == "caps") cmdCaps(wlan, a.iface);
         else if (a.command == "connect") {
-            if (a.opt.password.empty() && !a.dryRun)
+            if (a.opt.password.empty() && !a.dryRun) {
                 a.opt.password = readSecret("Password: ");
+                // Ctrl+C and a non-interactive stdin both leave this empty.
+                // Authenticating with an empty password only produces a
+                // confusing RADIUS rejection much later, so stop here.
+                if (a.opt.password.empty()) {
+                    std::fputs(
+                        "error: no password supplied. Pass --password-stdin "
+                        "(echo secret | edurm connect --password-stdin) or "
+                        "--password.\n",
+                        stderr);
+                    return 1;
+                }
+            }
 
             if (a.insecureSkip && !a.dryRun) {
                 std::printf(
@@ -549,8 +611,8 @@ int main(int argc, char** argv) {
                 }
             }
 
-            cmdConnect(wlan, a.opt, a.iface, a.allUsers, a.timeout, a.dryRun,
-                       a.maxLevel);
+            return cmdConnect(wlan, a.opt, a.iface, a.allUsers, a.timeout, a.dryRun,
+                              a.maxLevel);
         } else if (a.command == "disconnect") cmdDisconnect(wlan, a.iface);
         else if (a.command == "install") {
             if (a.positional.empty())

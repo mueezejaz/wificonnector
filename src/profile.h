@@ -54,8 +54,13 @@ std::string buildProfileXml(const ProfileOptions& opt);
 std::string buildEapUserCredentialsXml(const ProfileOptions& opt);
 
 // Loads a CA certificate from a .der/.pem/.cer file and returns base64 DER,
-// which is the form <TrustedRootCA> expects.
+// which is the form <TrustedRootCA> expects. PEM and raw DER are both accepted.
 std::string loadCertificateBase64(const std::string& path);
+
+// Same reader, exposed so eduroam.cpp can import a CA without duplicating the
+// PEM/DER detection (which previously lived in two places and both rejected
+// binary DER). Reads PEM, bare base64, or raw binary DER.
+std::string readCertificateBase64(const std::string& path);
 
 // Finds a certificate in the system trust stores by SHA-256 thumbprint and
 // returns it as base64 DER. Used to turn --pin-sha256 into a pin.
@@ -63,5 +68,9 @@ std::string findCertificateBySha256(const std::string& thumbprintHex);
 
 std::string redactPassword(const std::string& xml);
 std::string xmlEscape(const std::string& s);
+
+// True when `s` is well-formed UTF-8 (no overlong forms, surrogates or
+// out-of-range code points).
+bool isValidUtf8(const std::string& s);
 
 }  // namespace edurm

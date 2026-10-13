@@ -195,6 +195,15 @@ Two of these are easy to get wrong, and both are silent failures:
    eduroam, because the RADIUS server usually presents a certificate issued for
    the realm rather than for the SSID.
 
+> **Known gap:** the generator does **not** yet emit
+> `<domainSuffixMatch>` or `<validateServerCert>`. Today `--domain` only reaches
+> `msChapV2:LogonDomain` in the credentials blob, and the name check is made
+> with `<msPeapV2:AcceptServerName>` instead. So the "domain suffix is
+> enforced" claim below does not hold in the current build, and
+> `--no-suffix-match` is accepted but does nothing. Both are part of the
+> unresolved 802.1X work described in "Known remaining blocker"; see
+> `TEST_REPORT.md`.
+
 `<validateServerCert>` is always `true` here — an eduroam profile that skips
 server certificate validation is an open door to any rogue RADIUS on the SSID.
 
@@ -235,6 +244,7 @@ Options:
   --password-stdin     Read the password from stdin
   --interface <guid>   Target a specific interface
   --all-users          Install the profile for all users (needs admin)
+  --machine            install-ca: trust the CA machine-wide (needs admin)
   --tkip               Use TKIP instead of AES
   --no-suffix-match    Do not require the cert domain suffix
   --timeout <ms>       Connection timeout       (default: 45000)

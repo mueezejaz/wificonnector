@@ -24,7 +24,12 @@ struct InterfaceInfo {
 };
 
 struct NetworkInfo {
+    // Display form: printable text, or "<hex:...>" for a non-printable SSID.
     std::string ssid;
+    // The SSID bytes exactly as the radio reported them. A WLAN profile must be
+    // built from THESE bytes: building it from `ssid` would encode the literal
+    // text "<hex:...>" as the SSID and target a network that does not exist.
+    std::string ssidBytes;
     std::wstring profileName;
     bool connectable{false};
     DWORD notConnectableReason{0};

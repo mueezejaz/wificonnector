@@ -26,6 +26,10 @@ std::string reasonCodeText(DWORD code);
 // Lowercase hex of a byte range ("eduroam" -> "656475726f616d").
 std::string toHex(const std::string& bytes);
 
+// The SSID's raw bytes, exactly as received. Use this when building a WLAN
+// profile; ssidToString() is for display only.
+std::string ssidToBytes(const DOT11_SSID& ssid);
+
 // Decode a DOT11_SSID into a printable string, falling back to hex for
 // non-UTF-8 or non-printable payloads.
 std::string ssidToString(const DOT11_SSID& ssid);

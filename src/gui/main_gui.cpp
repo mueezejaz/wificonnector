@@ -139,6 +139,11 @@ private:
     // work
     void refreshStatus();
     void refreshInterfaces();
+    // Returns false (and leaves statusDetail_ explaining why) instead of
+    // throwing: this is called from the worker starters, which run on the UI
+    // thread inside WM_CREATE. An exception escaping the window procedure is
+    // not caught anywhere and takes the whole process down.
+    bool tryCurrentIface(GUID* out, bool complain = true);
     GUID currentIface() const;
     void loadIfacePref();
     void saveIfacePref() const;
@@ -696,6 +701,11 @@ void App::drawAdapterDropdown(HDC hdc) {
 
     FillRoundRect(hdc, rDrop_, S(8), cSurface_, cBorder_);
 
+    // adapterRows_ is indexed in lockstep with ifaces_, and ifaces_ is refreshed
+    // by the WM_TIMER (hot-plug) while the dropdown is open. Resize here so a
+    // newly appeared adapter can never write past the end.
+    if (adapterRows_.size() != ifaces_.size()) adapterRows_.resize(ifaces_.size());
+
     const int rowH = S(40);
     int y = rDrop_.top + S(4);
     for (size_t i = 0; i < ifaces_.size(); ++i) {
@@ -766,7 +776,10 @@ int App::hitTest(int x, int y) const {
 
     // The open dropdown sits on top and swallows clicks in its own area.
     if (dropOpen_) {
-        for (size_t i = 0; i < adapterRows_.size(); ++i)
+        // Bound by both vectors: they can briefly disagree while an adapter is
+        // being hot-plugged.
+        size_t n = adapterRows_.size() < ifaces_.size() ? adapterRows_.size() : ifaces_.size();
+        for (size_t i = 0; i < n; ++i)
             if (inside(adapterRows_[i]))
                 return kHitAdapterBase + static_cast<int>(i);
         return -2;  // inside the dropdown panel but not on a row
@@ -977,8 +990,14 @@ void App::selectNetwork(int index) {
 
     // Personal networks become PSK profiles; enterprise ones stay 802.1X.
     opt_.pskMode = !n.enterprise();
-    opt_.ssid = n.ssid;
-    opt_.profileName = n.ssid;
+    // Build the profile from the raw SSID bytes. opt_.ssid is the display form
+    // ("<hex:...>" for a non-printable SSID), so using it here made the profile
+    // target a network literally named "<hex:...>" instead of the real one.
+    opt_.ssid = n.ssidBytes.empty() ? n.ssid : n.ssidBytes;
+    // A profile name is a label shown in the Windows UI and ends up as XML
+    // text, so it must be valid UTF-8. Fall back to the hex form rather than
+    // writing "<hex:...>" as if it were the network's name.
+    opt_.profileName = isValidUtf8(opt_.ssid) ? opt_.ssid : n.ssid;
     fields_[kPass].clear();
 
     if (opt_.pskMode) focus_ = kPass;
@@ -1036,6 +1055,22 @@ GUID App::currentIface() const {
     if (selIface_ >= 0 && selIface_ < static_cast<int>(ifaces_.size()))
         return ifaces_[static_cast<size_t>(selIface_)].guid;
     throw std::runtime_error("no wireless interface available");
+}
+
+bool App::tryCurrentIface(GUID* out, bool complain) {
+    if (selIface_ >= 0 && selIface_ < static_cast<int>(ifaces_.size())) {
+        *out = ifaces_[static_cast<size_t>(selIface_)].guid;
+        return true;
+    }
+    const char* why = uiWlan_ ? "no wireless interface found"
+                               : "could not open the WLAN service (is it running?)";
+    busy_ = false;  // we set it before resolving, so release it again
+    statusHead_ = L"No adapter";
+    statusDetail_ = widen(std::string(why) + " - scan, connect and disconnect are unavailable");
+    // The status poll calls this every 1.2s, so only report a real attempt.
+    if (complain) pushLog(std::string("Error: ") + why);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return false;
 }
 
 // The chosen adapter is remembered between runs so the GUI opens on the same
@@ -1157,9 +1192,10 @@ void App::drainQueue() {
 }
 
 void App::refreshStatus() {
-    if (uiWlan_) {
+    GUID g{};
+    const bool haveIface = tryCurrentIface(&g, /*complain=*/false);
+    if (haveIface && uiWlan_) {
         try {
-            GUID g = currentIface();
             WLAN_CONNECTION_ATTRIBUTES c = uiWlan_->connection(g);
             if (c.isState == wlan_interface_state_connected) {
                 connected_ = true;
@@ -1178,8 +1214,11 @@ void App::refreshStatus() {
         }
     }
     connected_ = false;
-    statusHead_ = busy_ ? L"Working..." : L"Not connected";
-    statusDetail_ = L"Select a network below and press Connect.";
+    if (haveIface) {
+        statusHead_ = busy_ ? L"Working..." : L"Not connected";
+        statusDetail_ = L"Select a network below and press Connect.";
+    }
+    // When there is no adapter, keep the explanation tryCurrentIface() just set.
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -1191,8 +1230,18 @@ void App::startScan() {
 
     if (worker_.joinable()) worker_.join();
     // Resolve the adapter on the UI thread; the worker must not touch UI state.
-    const GUID gSel = currentIface();
+    GUID gSel{};
+    if (!tryCurrentIface(&gSel)) return;
     worker_ = std::thread([this, gSel] {
+        // job() must run on every exit path: drainQueue() only clears busy_
+        // when it sees qJobDone_, so an exception that skipped it left the whole
+        // window permanently frozen (every control greyed out, no keys accepted).
+        auto job = [this](bool wasConnect, bool ok) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            qWasConnect_ = wasConnect;
+            qResultOk_ = ok;
+            qJobDone_ = true;
+        };
         try {
             Wlan w;
             std::vector<NetworkInfo> nets = w.scan(gSel, 3000);
@@ -1200,12 +1249,11 @@ void App::startScan() {
                 std::lock_guard<std::mutex> lk(mtx_);
                 qNets_ = std::move(nets);
                 qHaveNets_ = true;
-                qWasConnect_ = false;
-                qResultOk_ = true;
-                qJobDone_ = true;
             }
+            job(/*wasConnect=*/false, /*ok=*/true);
             pushLog("Scan finished.");
         } catch (const std::exception& e) {
+            job(/*wasConnect=*/false, /*ok=*/false);
             pushLog(std::string("Error: ") + e.what());
         }
         PostMessage(hwnd_, WM_APP_DONE, 0, 0);
@@ -1237,9 +1285,16 @@ void App::startConnect() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 
     if (worker_.joinable()) worker_.join();
-    const GUID gSel = currentIface();
+    GUID gSel{};
+    if (!tryCurrentIface(&gSel)) return;
     const int maxLevel = maxLevel_;
     worker_ = std::thread([this, o, gSel, maxLevel] {
+        auto job = [this](bool wasConnect, bool ok) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            qWasConnect_ = wasConnect;
+            qResultOk_ = ok;
+            qJobDone_ = true;
+        };
         bool ok = false;
         try {
             Wlan w;
@@ -1251,15 +1306,11 @@ void App::startConnect() {
                     pushLog(std::string(stage == Stage::Failed ? "Error: " : "") + msg);
                 });
             ok = r.ok;
+            job(/*wasConnect=*/true, ok);
             for (const std::string& line : r.attempts) pushLog("  " + line);
         } catch (const std::exception& e) {
+            job(/*wasConnect=*/true, /*ok=*/false);
             pushLog(std::string("Error: ") + e.what());
-        }
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            qResultOk_ = ok;
-            qWasConnect_ = true;
-            qJobDone_ = true;
         }
         PostMessage(hwnd_, WM_APP_DONE, 0, 0);
     });
@@ -1272,23 +1323,24 @@ void App::startDisconnect() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 
     if (worker_.joinable()) worker_.join();
-    const GUID gSel = currentIface();
+    GUID gSel{};
+    if (!tryCurrentIface(&gSel)) return;
     worker_ = std::thread([this, gSel] {
-        bool ok = false;
+        auto job = [this](bool wasConnect, bool ok) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            qWasConnect_ = wasConnect;
+            qResultOk_ = ok;
+            qJobDone_ = true;
+        };
         try {
             Wlan w;
             w.disconnect(gSel);
             w.waitForState(gSel, wlan_interface_state_disconnected, 10000);
-            ok = true;
-        } catch (const std::exception& e) {
-            pushLog(std::string("Error: ") + e.what());
-        }
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            qResultOk_ = ok;
             // Not a connect: drainQueue must not print "Connected."
-            qWasConnect_ = false;
-            qJobDone_ = true;
+            job(/*wasConnect=*/false, /*ok=*/true);
+        } catch (const std::exception& e) {
+            job(/*wasConnect=*/false, /*ok=*/false);
+            pushLog(std::string("Error: ") + e.what());
         }
         PostMessage(hwnd_, WM_APP_DONE, 0, 0);
     });

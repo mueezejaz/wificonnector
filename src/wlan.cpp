@@ -23,21 +23,44 @@ struct MemFree {
 template <typename T>
 using Owned = std::unique_ptr<T, MemFree>;
 
-WLAN_INTERFACE_STATE currentState(Wlan& w, const GUID& iface) {
-    WLAN_INTERFACE_STATE state = wlan_interface_state_not_ready;
-    DWORD size = sizeof(WLAN_CONNECTION_ATTRIBUTES);
-    Owned<WLAN_CONNECTION_ATTRIBUTES> attrs(
-        static_cast<WLAN_CONNECTION_ATTRIBUTES*>(malloc(size)));
-    WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
+// A pre-allocated buffer for the WlanQueryInterface two-call pattern.
+//
+// Two allocations are in play and they have DIFFERENT owners:
+//   * the block this class malloc's, owned by this class, freed with free()
+//   * the block the WLAN service allocates on success, owned by the caller,
+//     freed with WlanFreeMemory()
+// The API overwrites the pointer it is given, so the caller's local copy is no
+// longer the address of our block - hence this class keeps its own.
+//
+// Previously `PWLAN_... raw = malloc(...)` gave the API &raw, so on success the
+// malloc'd block was orphaned (64 KB leaked per call) and on failure it was
+// released with WlanFreeMemory() even though malloc() produced it.
+struct QueryBuffer {
+    PVOID p{nullptr};
+    explicit QueryBuffer(std::size_t bytes) { p = malloc(bytes); }
+    ~QueryBuffer() { if (p) free(p); }
+    QueryBuffer(const QueryBuffer&) = delete;
+    QueryBuffer& operator=(const QueryBuffer&) = delete;
+    explicit operator bool() const { return p != nullptr; }
+};
 
-    if (!attrs) return wlan_interface_state_not_ready;
+WLAN_INTERFACE_STATE currentState(Wlan& w, const GUID& iface) {
+    QueryBuffer buf(sizeof(WLAN_CONNECTION_ATTRIBUTES));
+    if (!buf) return wlan_interface_state_not_ready;
+
+    PVOID data = buf.p;
+    DWORD size = sizeof(WLAN_CONNECTION_ATTRIBUTES);
+    WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
 
     DWORD rc = WlanQueryInterface(w.handle(), &iface,
                                   wlan_intf_opcode_current_connection, nullptr,
-                                  &size, reinterpret_cast<PVOID*>(&attrs), &type);
-    if (rc != ERROR_SUCCESS) return wlan_interface_state_not_ready;
-    state = attrs->isState;
-    return state;
+                                  &size, &data, &type);
+    if (rc != ERROR_SUCCESS || !data) return wlan_interface_state_not_ready;
+
+    // `data` is now the service's allocation; ~QueryBuffer still frees ours.
+    Owned<WLAN_CONNECTION_ATTRIBUTES> attrs(
+        static_cast<WLAN_CONNECTION_ATTRIBUTES*>(data));
+    return attrs->isState;
 }
 
 }  // namespace
@@ -129,6 +152,7 @@ std::vector<NetworkInfo> Wlan::scan(const GUID& iface, int settleMs) {
                 const WLAN_AVAILABLE_NETWORK& src = list->Network[i];
                 NetworkInfo n;
                 n.ssid = ssidToString(src.dot11Ssid);
+                n.ssidBytes = ssidToBytes(src.dot11Ssid);
                 n.profileName = src.strProfileName;
                 n.connectable = src.bNetworkConnectable != FALSE;
                 n.notConnectableReason = static_cast<DWORD>(src.wlanNotConnectableReason);
@@ -151,27 +175,50 @@ std::vector<NetworkInfo> Wlan::scan(const GUID& iface, int settleMs) {
               [](const NetworkInfo& a, const NetworkInfo& b) {
                   return a.signalQuality > b.signalQuality;
               });
-    return best;
+
+    // WlanGetAvailableNetworkList can return the same SSID more than once (one
+    // entry per advertised BSSID set), which netsh hides but we did not - the
+    // GUI showed duplicate rows. Collapse them, keeping the strongest entry and
+    // summing the BSSID count so nothing is lost.
+    std::vector<NetworkInfo> merged;
+    merged.reserve(best.size());
+    for (const NetworkInfo& n : best) {
+        auto it = std::find_if(merged.begin(), merged.end(),
+                               [&](const NetworkInfo& m) {
+                                   return m.ssidBytes == n.ssidBytes && m.auth == n.auth;
+                               });
+        if (it == merged.end()) {
+            merged.push_back(n);
+        } else {
+            if (n.signalQuality > it->signalQuality) it->signalQuality = n.signalQuality;
+            it->bssidCount += n.bssidCount;
+            if (it->profileName.empty()) it->profileName = n.profileName;
+        }
+    }
+    std::sort(merged.begin(), merged.end(),
+              [](const NetworkInfo& a, const NetworkInfo& b) {
+                  return a.signalQuality > b.signalQuality;
+              });
+    return merged;
 }
 
 WLAN_CONNECTION_ATTRIBUTES Wlan::connection(const GUID& iface) {
+    QueryBuffer buf(sizeof(WLAN_CONNECTION_ATTRIBUTES));
+    if (!buf) throw std::runtime_error("out of memory");
+
+    PVOID data = buf.p;
     DWORD size = sizeof(WLAN_CONNECTION_ATTRIBUTES);
     WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
 
-    PWLAN_CONNECTION_ATTRIBUTES raw =
-        static_cast<WLAN_CONNECTION_ATTRIBUTES*>(malloc(size));
-    if (!raw) throw std::runtime_error("out of memory");
-
     DWORD rc = WlanQueryInterface(h_, &iface, wlan_intf_opcode_current_connection,
-                                  nullptr, &size,
-                                  reinterpret_cast<PVOID*>(&raw), &type);
-    if (rc != ERROR_SUCCESS) {
-        WlanFreeMemory(raw);
-        throwWin32("WlanQueryInterface", rc);
-    }
+                                  nullptr, &size, &data, &type);
+    if (rc != ERROR_SUCCESS) throwWin32("WlanQueryInterface", rc);
+    if (!data) throw std::runtime_error("WlanQueryInterface returned no data");
 
-    WLAN_CONNECTION_ATTRIBUTES out = *raw;
-    WlanFreeMemory(raw);
+    // `data` is the service's allocation; ~QueryBuffer still frees ours.
+    Owned<WLAN_CONNECTION_ATTRIBUTES> attrs(
+        static_cast<WLAN_CONNECTION_ATTRIBUTES*>(data));
+    WLAN_CONNECTION_ATTRIBUTES out = *attrs;
     return out;
 }
 
@@ -287,26 +334,32 @@ std::vector<std::string> Wlan::supportedAuthCipherPairs(const GUID& iface) {
     // This opcode rejects the two-call "query the size first" pattern, so hand it a
 // generously sized buffer up front. The list is variable-length, hence the slack.
 constexpr DWORD kPairBufBytes = 64 * 1024;
-PWLAN_AUTH_CIPHER_PAIR_LIST raw = static_cast<WLAN_AUTH_CIPHER_PAIR_LIST*>(
-        malloc(kPairBufBytes));
-    if (!raw) throw std::runtime_error("out of memory");
+QueryBuffer buf(kPairBufBytes);
+    if (!buf) throw std::runtime_error("out of memory");
+    PVOID data = buf.p;
 
     DWORD size = kPairBufBytes;
     WLAN_OPCODE_VALUE_TYPE type = wlan_opcode_value_type_query_only;
     DWORD rc = WlanQueryInterface(
         h_, &iface, wlan_intf_opcode_supported_infrastructure_auth_cipher_pairs,
-        nullptr, &size, reinterpret_cast<PVOID*>(&raw), &type);
-    if (rc != ERROR_SUCCESS || !raw) {
-        WlanFreeMemory(raw);
+        nullptr, &size, &data, &type);
+    if (rc != ERROR_SUCCESS)
         throwWin32("WlanQueryInterface(supported auth/cipher)", rc);
-    }
+    if (!data)
+        throw std::runtime_error(
+            "WlanQueryInterface(supported auth/cipher) returned no data");
+
+    // `data` is the service's allocation (freed below with WlanFreeMemory);
+    // ~QueryBuffer frees our 64 KB block with free().
+    Owned<WLAN_AUTH_CIPHER_PAIR_LIST> raw(
+        static_cast<WLAN_AUTH_CIPHER_PAIR_LIST*>(data));
 
     std::vector<std::string> out;
+    out.reserve(raw->dwNumberOfItems);
     for (DWORD i = 0; i < raw->dwNumberOfItems; ++i) {
         out.push_back(authName(raw->pAuthCipherPairList[i].AuthAlgoId) + " / " +
                       cipherName(raw->pAuthCipherPairList[i].CipherAlgoId));
     }
-    WlanFreeMemory(raw);
     return out;
 }
 
@@ -317,8 +370,9 @@ WLAN_INTERFACE_STATE Wlan::waitForState(const GUID& iface,
     for (;;) {
         WLAN_INTERFACE_STATE s = currentState(*this, iface);
         if (s == want) return s;
-        if (s == wlan_interface_state_disconnected && want != wlan_interface_state_disconnected)
-            return s;  // gave up early
+        // No early exit on "disconnected" while waiting for "connected":
+        // disconnected is the state a connect attempt STARTS in, so bailing out
+        // on it reported failure for connections that were about to succeed.
         if (std::chrono::steady_clock::now() >= deadline) return s;
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }

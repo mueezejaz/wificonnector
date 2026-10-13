@@ -85,7 +85,52 @@ bool unb64(const std::string& in, std::string* out) {
     return true;
 }
 
+// Reads a certificate file (PEM, base64 or raw DER) and returns base64 DER,
+// which is the form <TrustedRootCA> expects.
+static std::string fileToBase64Cert(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open certificate file: " + path);
+    std::string raw((std::istreambuf_iterator<char>(f)),
+                    std::istreambuf_iterator<char>());
+    if (raw.empty()) throw std::runtime_error("certificate file is empty: " + path);
+
+    if (raw.find("-----BEGIN") != std::string::npos) {
+        size_t begin = raw.find("-----BEGIN");
+        size_t b = raw.find('\n', begin);
+        size_t e = raw.find("-----END");
+        if (b == std::string::npos || e == std::string::npos || e < b)
+            throw std::runtime_error("malformed PEM certificate: " + path);
+        std::string body = raw.substr(b + 1, e - b - 1);
+        std::string cleaned;
+        for (char c : body)
+            if (c != '-' && !isspace(static_cast<unsigned char>(c))) cleaned.push_back(c);
+        return cleaned;
+    }
+
+    // A .cer/.der file is raw binary DER, NOT base64. Passing it straight to
+    // unb64() as before could never succeed: DER bytes are not in the base64
+    // alphabet, so every DER file was rejected. Detect the two real cases:
+    // already-base64 text, or binary DER (an ASN.1 SEQUENCE starts with 0x30).
+    std::string trimmed;
+    for (char c : raw)
+        if (!isspace(static_cast<unsigned char>(c))) trimmed.push_back(c);
+
+    std::string decoded;
+    if (unb64(trimmed, &decoded) && !decoded.empty()) return trimmed;
+
+    if (!raw.empty() && static_cast<unsigned char>(raw[0]) == 0x30)
+        return b64(reinterpret_cast<const unsigned char*>(raw.data()),
+                   static_cast<DWORD>(raw.size()));
+
+    throw std::runtime_error(
+        "certificate is neither PEM, base64 nor a DER (ASN.1 SEQUENCE): " + path);
+}
+
 }  // namespace
+
+std::string readCertificateBase64(const std::string& path) {
+    return fileToBase64Cert(path);
+}
 
 const char* verifyLevelName(VerifyLevel lvl) {
     switch (lvl) {
@@ -103,6 +148,38 @@ bool parseVerifyLevel(const std::string& s, VerifyLevel* out) {
     if (s == "3" || s == "legacy-tls") { *out = VerifyLevel::LegacyTls; return true; }
     if (s == "4" || s == "no-validation") { *out = VerifyLevel::NoValidation; return true; }
     return false;
+}
+
+// True when `s` is well-formed UTF-8. An SSID is an arbitrary byte string, but
+// the profile declares encoding="UTF-8", so raw bytes that are not valid UTF-8
+// must never be written into <name> - it would make the whole document invalid
+// and WlanSetProfile would reject the profile. <hex> carries the bytes anyway.
+bool isValidUtf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra;
+        unsigned int cp;
+        if (c < 0x80) { ++i; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07u; }
+        else return false;  // continuation byte or invalid lead byte
+        if (i + extra >= s.size()) return false;
+        for (size_t k = 1; k <= extra; ++k) {
+            unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3Fu);
+        }
+        // Reject overlong forms, surrogates and out-of-range code points.
+        if (extra == 1 && cp < 0x80) return false;
+        if (extra == 2 && cp < 0x800) return false;
+        if (extra == 3 && cp < 0x10000) return false;
+        if (cp > 0x10FFFF) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        i += extra + 1;
+    }
+    return true;
 }
 
 std::string xmlEscape(const std::string& s) {
@@ -137,10 +214,14 @@ std::string buildProfileXml(const ProfileOptions& o) {
     xml += "<WLANProfile xmlns=\"" + std::string(kProfileNs) + "\">\r\n";
     xml += "\t<name>" + xmlEscape(o.profileName) + "</name>\r\n";
 
-    // Windows emits both hex and name; hex is what matters for non-ASCII SSIDs.
+    // Windows emits both hex and name; hex is what actually selects the network,
+    // so it is always written from the raw SSID bytes. <name> is human-facing
+    // XML text and is only emitted when those bytes are valid UTF-8 - otherwise
+    // the document would contradict its own encoding declaration.
     xml += "\t<SSIDConfig>\r\n\t\t<SSID>\r\n";
     xml += "\t\t\t<hex>" + toHex(o.ssid) + "</hex>\r\n";
-    xml += "\t\t\t<name>" + xmlEscape(o.ssid) + "</name>\r\n";
+    if (isValidUtf8(o.ssid))
+        xml += "\t\t\t<name>" + xmlEscape(o.ssid) + "</name>\r\n";
     xml += "\t\t</SSID>\r\n\t</SSIDConfig>\r\n";
 
     xml += "\t<connectionType>ESS</connectionType>\r\n";
@@ -314,39 +395,7 @@ std::string buildEapUserCredentialsXml(const ProfileOptions& o) {
 }
 
 std::string loadCertificateBase64(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open certificate file: " + path);
-    std::string raw((std::istreambuf_iterator<char>(f)),
-                    std::istreambuf_iterator<char>());
-    if (raw.empty()) throw std::runtime_error("certificate file is empty: " + path);
-
-    // Strip PEM armour if present.
-    std::string body;
-    if (raw.find("-----BEGIN") != std::string::npos) {
-        size_t b = raw.find("-----BEGIN");
-        b = raw.find('\n', b);
-        size_t e = raw.find("-----END");
-        if (b == std::string::npos || e == std::string::npos || e < b)
-            throw std::runtime_error("malformed PEM certificate: " + path);
-        body = raw.substr(b + 1, e - b - 1);
-        // strip any remaining '-' characters
-        std::string cleaned;
-        for (char c : body)
-            if (c != '-' && c != '\r' && c != '\n' && c != ' ') cleaned.push_back(c);
-        body = cleaned;
-    } else {
-        body = raw;
-    }
-
-    // A raw certificate is base64 already; <TrustedRootCA> wants base64 DER.
-    std::string trimmed;
-    for (char c : body)
-        if (!isspace(static_cast<unsigned char>(c))) trimmed.push_back(c);
-
-    std::string der;
-    if (!unb64(trimmed, &der) || der.empty())
-        throw std::runtime_error("could not decode certificate: " + path);
-    return trimmed;  // already base64
+    return ::edurm::readCertificateBase64(path);
 }
 
 std::string findCertificateBySha256(const std::string& thumbprintHex) {
