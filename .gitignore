@@ -1,0 +1,14 @@
+# Build output
+build/
+*.obj
+*.pdb
+*.ilk
+*.exe
+.vs/
+
+# Local captures and screenshots
+*.png
+tools/*.png
+
+# Reference photo of a credentials card - contains a student ID, do not publish
+pic.jpg
